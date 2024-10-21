@@ -1,0 +1,311 @@
+---
+title: 'MovieLens Project'
+subtitle: 'HarvardX PH125.9x - Data Science: Capstone'
+author: 'Emanuela Pannini'
+date: '2024-10-21'
+output: pdf_document
+bibliography: bibliography.bib
+csl: https://www.zotero.org/styles/ieee
+urlcolor: blue
+linkcolor: black
+---
+\newpage
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, out.width='70%', fig.align = 'center', fig.pos = 'h')
+```
+
+```{r rfile_upload, include=FALSE}
+source('movielens.r')
+```
+
+```{r rfile_read, include=FALSE}
+# Read the entire file
+movielens_lines <- readLines('movielens.r')
+num_lines <- length(movielens_lines)
+
+# List of functions that we need to search
+function_names <- c('simple_prediction',
+                    'double_time_dependence_model',
+                    'time_dependence_model',
+                    'regularized_time_dependent_model',
+                    'prediction_regularized_time_dependent_model')
+
+# Create a dataframe to store the declarations
+function_declarations <- data.frame(name = function_names,
+                                    declaration = '')
+
+# Find the declaration for all the functions
+for (current_function in function_names){
+
+  # Search for the line where the function is declared
+  start_line <- grep(sprintf("^%s <- function", current_function), movielens_lines)
+
+  # Search for the line where the declaration ends
+  # Note: all the code is formatted to end in a new line with }
+  # and the pattern matches onlythis formatting
+  end_line <- start_line
+  for (i in seq(start_line, num_lines)) {
+    if (grepl('^}$', movielens_lines[i])) {
+      end_line <- i
+      break
+    }
+  }
+
+  # Extract the declaration of the current function
+  # joining each line to a single string
+  extracted_declaration <- paste(movielens_lines[start_line:end_line],
+                                 collapse = '\n')
+
+  # Update the value in the dataframe with the extracted declaration
+  function_declarations$declaration[
+    function_declarations$name == current_function] <- extracted_declaration
+
+  # Remove the temporary variables before entering the next loop iteration
+  rm(extracted_declaration, start_line)
+}
+```
+
+\newpage
+
+\tableofcontents
+
+\newpage
+
+# Introduction
+
+This project aims to predict the rating that an user will give to a particular movie, based on the main general features. In this case all the data came from the [Movielens dataset](https://grouplens.org/datasets/movielens/latest/).
+Due to performances, we will use the version containing just 10M rows and not the full one. The Movielens dataset has the following structure, with `r nrow(edx)` rows and `r ncol(edx)` columns, where these are the original ones:
+
+- `userId`: ID of the user that has rated the movie
+- `movieId`: ID of the movie
+- `rating`: rate that was assigned to the movie. This is a number between 0.5 and 5, with steps of 0.5
+- `timestamp`: the unix time related to the review time
+- `title`: the name of the movie and the year of release, embraced between parenthesis
+- `genres`: the list of genres assigned to that movie. Each category is divided by | and each movie can be assigned to more than one
+
+and, as it will be clarified in this analysis, these are the columns that we added:
+
+- `releaseYear`: year of release of the movie, extracted by the title column. Before adding this new column it was also checked that each `movieId` has a release year and that each movie has only `r releaseYear_per_movie` `releaseYear`
+- `reviewDate`: conversion of the `timestamp` column to an human-readable date format
+- `deltaReleaseYear`: difference (in years) between the `releaseYear` of the first movie in the dataset and the `releaseYear` of the given movie. The reason why this column is needed is explained later in the document
+- `deltaReviewDate`: difference (in weeks) between the `reviewDate` of the first review in the dataset and the `reviewDate` of the given review. As before, further details will be added below
+
+From Edx, it was provided a code that splits the initial dataset into `edx` and `final_holdout_test`. The latter one, will be used only at the end to evaluate the performances of the final model through RMSE, that evaluates the deltas as stated in [@EdxTestbook]:
+$$
+RMSE = \sqrt{\frac{1}{N}\sum_{m, u}(\hat{y}_{m, u} - y_{m, u})^2}
+$$
+where $\hat{y}_{m, u}$ is the prediction for movie $m$ and user $u$ and $y_{m, u}$ the actual value.
+
+Similarly, the `edx` dataset has been split into `edx_train` and `edx_test` and, in the following sections, we will show the RMSE between `edx_train` and `edx_test`. We will then evaluate the RMSE on the `final_holdout_test` using the best model.
+For performance reasons, cross-validation or other techniques that perform multiple splitting of the set are not presented here, even though they could be used to test additional cases.
+
+\newpage
+
+# Analysis
+
+A quick inspection reveals that the Movielens dataset has `r edx_movies` distinct movies and `r edx_users` different users. So, as expected, each user has only rated a few movies and each movie has only been rated by a few users. The heatmap that shows whether a user has rated a movie is very sparse, with a fill level of `r nrow(edx)/(edx_movies * edx_users)` and, since the full heatmap would not be informative, only a section is depicted below:
+
+```{r sparsity_plot}
+sparsity_plot
+```
+
+In addition to the one in [@EdxTestbook], this heatmap also illustrates the ratings assigned by users to the same `movieId`, with the different ratings highlighted in distinct colours. Viceversa, it is also possible to observe instances where an user has rated different movies, assigning different ratings. Furthermore, as you might expect, users are more likely to give a movie a full star than a half star, with a significant difference between the two categories:
+
+```{r rating_distribution}
+rating_distribution
+```
+
+In order to understand what might be the best features to include in the final model, an exploratory analysis is presented below, which should highlight some dependencies. Some of the following plots were inspired by those found in [@EdxTestbook], although they were all subsequently redeveloped and adjusted to highlight some features or trends. As expected, one of the most important features is the `movieId`, as it allows us to distinguish between masterpieces and minor works. Clearly some movies received more reviews than others, here are all the movies with less than 1500 reviews, as they are the majority:
+
+```{r review_per_movie}
+movie_rating
+```
+
+If we instead look at the average rating for each movie, we get the following plot:
+
+```{r movie_average}
+movie_average
+```
+
+and, as might be expected, the majority of movies received a rating in the middle part of the range, decreasing towards the extremes. The same idea can be extended to users to show the number of reviews given by an user. Also in this case, in order to present an informative plot, the one below has been pre-filtered on the `userId` who have rated less than 750 movies, as they are the great majority:
+
+```{r review_per_user}
+user_rating
+```
+
+Similarly, below is displayed the average rating given by users:
+
+```{r user_average}
+user_average
+```
+
+In addition, we intuitively expect the genre to affect the ratings and we developed some plots to verify this hypothesis and to get a better understanding. For example, the first idea was to take the mean and standard error for each category, sort them by mean and highlight the error bars. The name of the category has been removed for readability, but it remains clear that `genres` feature affects the rate and should be included in the models:
+
+```{r genres_distribution}
+genres_distribution
+```
+
+Another hypothesis might be that it is possible to achieve better results by dividing the `genres` into macro-categories, but the result is less informative, as shown in the plot below:
+
+```{r split_genres_distribution}
+split_genres_distribution
+```
+
+This phenomenon can also be explained by the fact that each movie usually has more than one macro-category, and that this combination tells more about the movie and the expected rating:
+
+```{r genres_per_movie}
+genres_per_movie
+```
+
+The plot above does not take into account the fact that some `genres` are correlated or excluded due to the definition of the category. For example, it is unlikely to have a movie with `Horror` and `Children` as a category and, on the contrary, it is likely to have `Animation` and `Children` as a combination. It is also possible to perform a deep similarity analysis between categories and genres, however it was not investigated more as it was considered beyond the scope of this project. As anticipated in the previous section, it is also reasonable to predict some differences according to the year of release, and that's why the column `releaseYear` was added by parsing the information in the title. In the plot below, it can be seen how the number of reviews varies over the `releaseYear`, using a standard boxplot showing the outliers:
+
+```{r ratings_per_releaseYear}
+ratings_per_releaseYear
+```
+
+Of course, it is possible to follow this path and analyse how the rating varies, as shown in the following boxplot structure (i.e. median, quartiles, outliers) and through the purple squares, representing the mean:
+
+```{r averages_per_release_year}
+averages_per_release_year
+```
+
+Furthermore, we can also note how the number of reviews varies over the `reviewDate` years, starting from the first one on 1995:
+
+```{r review_rate}
+review_rate
+```
+
+This plot could be modified to make it more informative, taking into account the number of movies released during the year and the number of reviews in relation to previous years, scaled over time. Unfortunately, the dataset has a lot of movies released before the 90s, so it is not straightforward to extrapolate how the number of reviews per year affects the rating, even if the plot below attempts to do so. Specifically, the `edx` dataset was pre-filtered on movies released after 1995 and, assuming that each film could be reviewed until the last `reviewDate` in the dataset, the average number of reviews per year was evaluated as the ratio between the total number of reviews and the years after release. So, a smooth fit was performed and it is possible to catch how a higher number of reviews suggests a higher rate:
+
+```{r review_rate_average_rating, message=FALSE}
+review_rate_average_rating
+```
+
+Nowadays, as the number of reviews has increased through different streaming platforms, a new dataset would have many more recent reviews and it will also be possible to analyse this trend over a longer period of time. Furthermore, one could also better verify if and how users tend to review masterpieces even a long time after their release.
+
+\newpage
+
+# Models
+
+Since we want to predict ratings, we expect that the simplest idea should at least include some of the features that have emerged in this brief analysis (i.e. movies, users, genres and review week). So here we follow and extend the general idea proposed in [@EdxTestbook], using a linear estimation of the target (due to the same limitations related to machine capability). Already knowing that these simpler models will not fit sufficiently, the first model is:
+
+$$
+Y_{u, m} = \mu + b_m + b_u + \sum_k x_{u, m}^k b_g + b_y + \varepsilon_{u,m}
+$$
+where $u$ refers to the user, $m$ to the movie, $x_{u, m}^k$ equal 1 if and only if the couple $u, m$ has genre $k$ and $y$ is the year of release. In this way it is possible to assign a different weight to each specific genre, as shown also in the previous section, and also to keep track of the historical period of the production.
+
+From a technical point of view, even if it is not necessary, in this report all models will be explained by functions in order to get a better visualisation. Moreover, unless otherwise specified, the training part on `edx_train` and the test part on `edx_test` will be kept together in order to have a complete overview. In this case, the code for this simpler model is as follows:
+
+```{r simple_prediction}
+cat(function_declarations$declaration[function_declarations$name == 'simple_prediction'],
+    sep = "\n")
+```
+
+and evaluated on `edx_test` gave a result of as RMSE:
+
+```{r simple}
+RMSE_summary <- data.frame(Model = 'Simple model', as.data.frame(simple))
+knitr::kable(RMSE_summary, format = 'latex', caption = 'RMSEs summary', position = 'h')
+```
+
+Since the users could only express ratings with values between 0.5 and 5 in steps of 0.5, we tried to round the prediction to the nearest feasible value before evaluating the RMSE. After doing that we observed that this option results in a higher RMSE, so the prediction is worse. The following models will always report both versions of the prediction to show that this idea always under performs when compared to the non-rounded one.
+
+As the RMSE value is not satisfying, the idea is to increase the accuracy by refining the effect related to the review week. As explained in the [Analysis] section and as suggested by the exercises in the [@EdxTestbook], the plot shows a time dependence of this feature:
+
+```{r review_time_dependence, message=FALSE}
+review_time_dependence
+```
+
+So, we will use the `mgcv` library to create a smooth fit and include it in the next model. It was decided to use the `mgcv` library [@mgcvPackage] because other techniques (such as `gam`) caused a lot of performance problems on the machine. For the same reason and to avoid overfitting, the `reviewDate` information (originally present in the dataset) was aggregated to a weekly level. At this point, we imagined that both the review week and the release year would be a good fit, so the next model was developed:
+
+```{r double_time_dependence_model}
+cat(function_declarations$declaration[function_declarations$name == 'double_time_dependence_model'],
+    sep = "\n")
+```
+
+The RMSE value is better than the previous one, but it is still not good enough:
+
+```{r double_time_dependence}
+RMSE_summary <- rbind(RMSE_summary, data.frame(Model = 'Double time dependence', as.data.frame(double_time_dependence)))
+knitr::kable(RMSE_summary, format = 'latex', caption = 'RMSEs summary', position = 'h')
+```
+\newpage
+
+From a detailed inspection of the results, it is possible to see that the smooth function is not really suitable when it is also applied to the release year, as it is more related to the movie. So, taking into account all this information, the next idea is to mix these two approaches to finalise this model:
+
+```{r time_dependence_model}
+cat(function_declarations$declaration[function_declarations$name == 'time_dependence_model'],
+    sep = "\n")
+```
+
+In this case, the smooth fit is only applied to the `reviewDate` and the `releaseYear` is considered as a standard effect. This seems to be more consistent with respect to the [Analysis] section and indeed gives a more accurate view of the real dependencies:
+
+\newpage
+
+```{r time_dependence, echo=FALSE}
+RMSE_summary <- rbind(RMSE_summary, data.frame(Model = 'Time dependence', as.data.frame(time_dependence)))
+knitr::kable(RMSE_summary, format = 'latex', caption = 'RMSEs summary', position = 'h')
+```
+
+However, not all movies should have the same strength to adjust the prediction [@EdxTestbook], so we decided to add a regularisation term to compensate for some discrepancies, resulting in the following model:
+
+```{r regularized_time_dependent_model}
+cat(function_declarations$declaration[function_declarations$name == 'regularized_time_dependent_model'],
+    sep = "\n")
+```
+
+In this case, the training and evaluation parts are stored in two different functions to better distinguish the two phases. As you can see from the above code, this model relies on a $\lambda$ value that should be fitted in an appropriate way to adjust the importance of each entry. So, the main idea is to train on `edx_train` with different $\lambda$ values, test each model on `edx_test` and choose the best value for $\lambda$ by selecting the one that minimises the RMSE. The function that we will use to predict the ratings is:
+
+```{r prediction_regularized_time_dependent_model}
+cat(function_declarations$declaration[function_declarations$name == 'prediction_regularized_time_dependent_model'],
+    sep = "\n")
+```
+
+In order to tune and choose the optimal value for $\lambda$, it is useful to visualise the deltas in RMSE associated with the different values, so the following plot and summary have been constructed:
+
+```{r lambda_values}
+lambda_values
+```
+
+```{r summary_regularized_rmses}
+knitr::kable(summary_regularized_rmses, format = 'latex', caption = 'Regularized RMSEs summary', position = 'h')
+```
+
+For performance reasons, only a subset of the tests for fine-tuning the value of $\lambda$ is presented in this final version. If you have a better machine and are interested, you can modify the declaration of the `lambdas` variable with a different range, including a finer step and/or a wider range. On the contrary, you can speed up this part by setting the range of `lambdas` to a specific value. Anyway, it is possible to determine `r final_lambda` as the final value for $\lambda$ and the models presented above can be summarized as follows:
+
+```{r edx_test_summary}
+regularized_time_dependence <- summary_regularized_rmses %>%
+                                  filter(lambda_value == final_lambda) %>%
+                                  select(-lambda_value)
+RMSE_summary <- rbind(RMSE_summary, data.frame(Model = 'Regularized time dependence', as.data.frame(regularized_time_dependence)))
+knitr::kable(RMSE_summary, format = 'latex', caption = 'RMSEs summary', position = 'h')
+```
+
+\newpage
+
+# Results
+
+From the [Analysis] and [Models] sections it is straightforward to notice that the regularised model that also includes the time dependence is the best one. However, as it is also important to take into account performances, it is important to notice that the tuning part of $\lambda$ is quite time consuming, especially on standard laptops. On the contrary, the other models are faster but lose some accuracy, even if the results are not so bad if compared to the simplicity of the model. In a real-world scenario, it is also important to consider that the training phase is run once (or few times) and after that only the predictions are needed and, under this point of view, all the models produce an output in a reasonable time.
+
+Anyway, the final model is the time-dependent one with a regularisation term. This approach includes movie, user, genre, year of release and week of review, trying to extrapolate as many features as possible. Thus, the final model applied to the `final_holdout_test` gave an RMSE of:
+
+```{r final_evaluation}
+holdout_evaluation <- as.data.frame(final_evaluation) %>%
+                        select (-RMSE_rounded)
+RMSE_holdout <- data.frame(Model = 'Regularized time dependence', holdout_evaluation, RMSE_target = '< 0.86490')
+knitr::kable(RMSE_holdout, format = 'latex', caption = 'RMSEs final holdout test', position = 'h')
+```
+
+and it is satisfactory when compared to the project requirements.
+
+# Conclusions
+
+This report presents an analysis of the MovieLens dataset, beginning with an examination of its general structure and subsequently exploring the principal connections between its features In this case, the pre-processing phase was not required, as Edx had already provided the code for the dataframe. Nevertheless, this phase is typically a crucial stage in any project. Similarly, no data cleaning was performed, as the data were already well structured and no rows needed to be removed. Furthermore, all the data were coherent and valued as expected, facilitating the inspection and modeling phase. Subsequently, a simple linear estimation was employed, which was then improved with the addition of other meaningful effects, including a time dependence on review week and a regularisation term. The final model gave us a satisfactory RMSE related to the course target, even if it is of course possible to reduce it. From a theoretical point of view it could be a good idea to perform a PCA analysis or some common ML models that can better understand the main features (i.e. random forest, knn, etc...). Performance limitations were also considered in this development, so some of them were excluded for this reason. In addition, another idea could be to use cross-validation instead of splitting the `edx` set into fixed training and test sets. It is also possible to develop a similarity analysis to get a better insight into the real impact of the `genres` column. This idea is not presented here because it did not produce a satisfactory result, although it could be a good starting point for extending this project.
+
+\newpage
+
+# Notes
+In this project, the impersonal form "we" was employed. However, it should be noted that the project was developed independently, without external interference. As explained during the course and highlighted in [@EdxTestbook] and [@colorComparison], it is important to visualise data in the most readable manner for everyone. So, all the graphical elements in this project are created using the [RdPu palette](https://loading.io/color/feature/RdPu-5/), as you can see in [@colorPalette]. In addition, all analyses were performed with a laptop with 8GB RAM and i5-1135G7 CPU so they took quite a long time and some other analyses would have been prohibitive. However, if your machine is better than mine, you can run multiple tests on different $\lambda$ or run additional models. Otherwise, if your machine is not that powerful, I would like to inform you that running the whole project could take more than 2 hours, even after having properly reduced the fine tune part for $\lambda$. It might be helpful to execute only the R file, so that you can run only the interesting parts, avoiding useless computations and allowing flexibility in testing.
+
+# Bibliography
+
